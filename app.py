@@ -1,12 +1,16 @@
 import io
 import os
+import re
+import subprocess
+import threading
+from collections import Counter
 import tempfile
 import textwrap
 import zipfile
 
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 from moviepy.editor import (
     AudioFileClip,
     CompositeAudioClip,
@@ -115,6 +119,167 @@ def overlay_caption(clip, text, font_size=56):
     return CompositeVideoClip([clip, cap])
 
 
+# ------------------------------------------------------------------ voice (edge-tts neural, gTTS fallback)
+VOICES = {
+    "en": {"Female": "en-US-JennyNeural", "Male": "en-US-GuyNeural"},
+    "ar": {"Female": "ar-QA-AmalNeural", "Male": "ar-QA-MoazNeural"},
+    "fr": {"Female": "fr-FR-DeniseNeural", "Male": "fr-FR-HenriNeural"},
+    "es": {"Female": "es-ES-ElviraNeural", "Male": "es-ES-AlvaroNeural"},
+    "de": {"Female": "de-DE-KatjaNeural", "Male": "de-DE-ConradNeural"},
+    "hi": {"Female": "hi-IN-SwaraNeural", "Male": "hi-IN-MadhurNeural"},
+    "tr": {"Female": "tr-TR-EmelNeural", "Male": "tr-TR-AhmetNeural"},
+}
+
+
+def make_voice(text, path, lang="en"):
+    """Synthesize `text` to an mp3 at `path`. Neural voice if possible, else gTTS."""
+    if voice_engine.startswith("Neural"):
+        try:
+            import asyncio
+
+            import edge_tts
+
+            voice = VOICES.get(lang, VOICES["en"])[voice_gender]
+            rate = f"{voice_rate:+d}%"
+            errors = []
+
+            def _worker():
+                try:
+                    asyncio.run(edge_tts.Communicate(text, voice, rate=rate).save(path))
+                except Exception as e:  # noqa: BLE001
+                    errors.append(e)
+
+            th = threading.Thread(target=_worker)
+            th.start()
+            th.join()
+            if errors:
+                raise errors[0]
+            if os.path.getsize(path) > 0:
+                return
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"Neural voice unavailable ({e}). Using the basic voice instead.")
+    from gtts import gTTS
+
+    gTTS(text, lang=lang).save(path)
+
+
+def normalize_audio(path):
+    """Single-pass loudness normalisation to about -14 LUFS. Falls back to the original file."""
+    try:
+        import imageio_ffmpeg
+
+        out = tmp_path()
+        subprocess.run(
+            [
+                imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", path,
+                "-c:v", "copy", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", out,
+            ],
+            check=True, capture_output=True, timeout=900,
+        )
+        return out
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"Loudness normalisation skipped: {e}")
+        return path
+
+
+# ------------------------------------------------------------------ visual extras
+def zoom_clip(c, amount=0.06):
+    """Slow zoom-in (Ken Burns) on a static clip."""
+    w, h = c.size
+    d = c.duration
+    z = c.resize(lambda t: 1 + amount * t / d).set_position("center")
+    return CompositeVideoClip([z], size=(w, h)).set_duration(d)
+
+
+def cover_crop(img, size):
+    s = max(size[0] / img.width, size[1] / img.height)
+    img = img.resize((int(img.width * s) + 1, int(img.height * s) + 1))
+    left, top = (img.width - size[0]) // 2, (img.height - size[1]) // 2
+    return img.crop((left, top, left + size[0], top + size[1]))
+
+
+def make_thumb_variants(clip, title, size=(1280, 720)):
+    """Three different thumbnail layouts from different frames (for A/B comparison)."""
+    W, H = size
+    out = {}
+    text = title.upper()
+    for name, frac in (("A", 0.1), ("B", 0.45), ("C", 0.75)):
+        t = max(0.0, min(clip.duration - 0.05, clip.duration * frac))
+        img = cover_crop(Image.fromarray(clip.get_frame(t)).convert("RGB"), size)
+        if name == "C":
+            img = ImageEnhance.Contrast(ImageEnhance.Color(img).enhance(1.4)).enhance(1.15)
+        img = Image.blend(img, Image.new("RGB", size, (0, 0, 0)), 0.15 if name == "C" else 0.3)
+        if name == "A":  # centred
+            draw = ImageDraw.Draw(img)
+            font = get_font(90)
+            lines = wrap_draw(draw, text, font, W * 0.88)[:3]
+            y = (H - 105 * len(lines)) / 2
+            for line in lines:
+                tw = draw.textlength(line, font=font)
+                draw.text(((W - tw) / 2, y), line, font=font, fill="white", stroke_width=6, stroke_fill="black")
+                y += 105
+        elif name == "B":  # lower-left bar, clear of the duration stamp in the bottom-right corner
+            ov = Image.new("RGBA", size, (0, 0, 0, 0))
+            d2 = ImageDraw.Draw(ov)
+            font = get_font(78)
+            lines = wrap_draw(d2, text, font, W * 0.74)[:2]
+            lh = 92
+            y0 = H - 70 - lh * len(lines)
+            d2.rectangle([0, y0 - 24, int(W * 0.82), y0 + lh * len(lines) + 8], fill=(0, 0, 0, 190))
+            for i, line in enumerate(lines):
+                d2.text((50, y0 + i * lh), line, font=font, fill=(255, 220, 0, 255), stroke_width=3, stroke_fill=(0, 0, 0, 255))
+            img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+        else:  # top-left, saturated
+            draw = ImageDraw.Draw(img)
+            font = get_font(110)
+            lines = wrap_draw(draw, text, font, W * 0.62)[:3]
+            y = 60
+            for line in lines:
+                draw.text((60, y), line, font=font, fill="white", stroke_width=7, stroke_fill=(200, 0, 0))
+                y += 125
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=90)  # YouTube limit: 2 MB
+        out[name] = buf.getvalue()
+    return out
+
+
+# ------------------------------------------------------------------ chapters & SEO helpers
+def fmt_ts(sec):
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def build_chapters(texts, durations, min_len=10):
+    """YouTube chapters: start at 0:00, at least 3, each at least 10 s. Returns '' if not possible."""
+    chapters, t, last = [], 0.0, None
+    for text, d in zip(texts, durations):
+        if last is None or t - last >= min_len:
+            chapters.append((t, text.strip()[:50]))
+            last = t
+        t += d
+    if len(chapters) >= 2 and t - chapters[-1][0] < min_len:
+        chapters.pop()
+    if len(chapters) < 3:
+        return ""
+    return "\n".join(f"{fmt_ts(s)} {label}" for s, label in chapters)
+
+
+STOP = set(
+    "the a an and or but if of to in on at for with from by is are was were be been it this that these those as not no "
+    "you your we our they their i he she his her its can will just than then so do does did have has had about into over "
+    "more most very how what why when who which there here also".split()
+)
+
+
+def seo_suggestions(text):
+    words = re.findall(r"[^\W\d_]{3,}", text.lower())
+    counts = Counter(w for w in words if w not in STOP)
+    return [w for w, _ in counts.most_common(8)], len(text.split())
+
+
 # ------------------------------------------------------------------ fit / audio / export
 def blur_frame(f):
     img = Image.fromarray(f)
@@ -192,6 +357,9 @@ def finalize(clip):
     cfg = PRESETS[preset]
     with st.spinner("Encoding for YouTube..."):
         clip = fit_clip(clip, cfg["size"], fit_mode)
+        if outro_on:
+            card = text_card(outro_text, cfg["size"], ((20, 30, 70), (120, 40, 120)), 90)
+            clip = concatenate_videoclips([clip, ImageClip(np.array(card)).set_duration(3)], method="compose")
         if music_file is not None:
             mp = tmp_path(os.path.splitext(music_file.name)[1] or ".mp3")
             with open(mp, "wb") as f:
@@ -199,10 +367,17 @@ def finalize(clip):
             clip = add_music(clip, mp, music_vol)
         out = tmp_path()
         export_youtube(clip, out)
+        if loudnorm_on and clip.audio is not None:
+            out = normalize_audio(out)
         with open(out, "rb") as f:
             video_bytes = f.read()
-        thumb = None if cfg["short"] else make_thumbnail(clip, title or "My Video")
+        thumbs = {} if cfg["short"] else make_thumb_variants(clip, title or "My Video")
+        thumb = thumbs.get("A")
         desc = description
+        if music_file is not None and music_credit.strip():
+            desc += f"\n\nMusic: {music_credit.strip()}"
+        if chapters_text and not cfg["short"]:
+            desc += "\n\nChapters:\n" + chapters_text
         if cfg["short"] and "#shorts" not in desc.lower():
             desc = (desc + "\n\n#Shorts").strip()
         meta = (
@@ -214,12 +389,14 @@ def finalize(clip):
             "- 'Altered content': answer Yes if the video has realistic synthetic people/places/events.\n"
             "- Only use music/footage you own or have a licence for.\n"
         )
+        if ai_disclosure:
+            meta += "- ALTERED CONTENT: choose YES in YouTube Studio's upload details. It cannot be set from this file.\n"
         zbuf = io.BytesIO()
         with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("video.mp4", video_bytes)
             z.writestr("metadata.txt", meta)
-            if thumb:
-                z.writestr("thumbnail.jpg", thumb)
+            for k, v in thumbs.items():
+                z.writestr(f"thumbnail_{k}.jpg", v)
     dur = clip.duration
     if cfg["short"] and dur > 180:
         st.warning(f"This Short is {dur:.0f}s. Shorts must be 3 minutes or less to be treated as a Short.")
@@ -233,8 +410,11 @@ def finalize(clip):
         c2.download_button("⬇️ thumbnail.jpg", thumb, "thumbnail.jpg", "image/jpeg")
     c3.download_button("⬇️ metadata.txt", meta, "metadata.txt")
     c4.download_button("📦 Everything (.zip)", zbuf.getvalue(), "youtube_package.zip", "application/zip")
-    if thumb:
-        st.image(thumb, caption="Auto thumbnail (1280x720)", width=480)
+    if thumbs:
+        st.caption("Thumbnail variants A/B/C (all in the ZIP). Pick one, or compare them if Studio offers thumbnail testing for your channel.")
+        for col, (k, v) in zip(st.columns(3), thumbs.items()):
+            col.image(v, caption=f"Variant {k}")
+            col.download_button(f"thumbnail_{k}.jpg", v, f"thumbnail_{k}.jpg", "image/jpeg", key=f"th{k}")
     st.text_area("Metadata preview", meta, height=220)
 
 
@@ -248,6 +428,17 @@ tags = st.sidebar.text_input("Tags (comma separated)", "video, tutorial")
 st.sidebar.subheader("Background music (optional)")
 music_file = st.sidebar.file_uploader("Music you have rights to", type=["mp3", "wav", "m4a"])
 music_vol = st.sidebar.slider("Music volume", 0.0, 1.0, 0.15, 0.05)
+music_credit = st.sidebar.text_input("Music credit / licence note (added to description)")
+st.sidebar.subheader("Voice & audio")
+voice_engine = st.sidebar.radio("Voice engine", ["Neural (edge-tts)", "Basic (gTTS)"])
+voice_gender = st.sidebar.radio("Voice", ["Female", "Male"], horizontal=True)
+voice_rate = st.sidebar.slider("Speaking speed (%)", -30, 30, 0, 5)
+loudnorm_on = st.sidebar.checkbox("Normalize loudness (about -14 LUFS)", True)
+st.sidebar.subheader("Extras")
+outro_on = st.sidebar.checkbox("Add 3 s subscribe outro card", False)
+outro_text = st.sidebar.text_input("Outro text", "Thanks for watching! Subscribe for more.")
+ai_disclosure = st.sidebar.checkbox("Video has realistic AI-generated / synthetic scenes", False)
+chapters_text = ""
 
 with st.expander("⚠️ Read before monetising on YouTube"):
     st.markdown(
@@ -257,6 +448,43 @@ with st.expander("⚠️ Read before monetising on YouTube"):
 - Use **Altered content** disclosure when realistic synthetic media is shown.
 - Don't use copyrighted music or footage you don't have rights to.
         """
+    )
+
+with st.expander("🔎 SEO & script helper (title ideas, tags, hashtags, timing)"):
+    seo_text = st.text_area("Paste your script or describe the topic", key="seo_text", height=120)
+    if st.button("Suggest metadata", key="seo_btn"):
+        kws, n_words = seo_suggestions(seo_text)
+        if len(kws) < 2:
+            st.warning("Add a little more text (English works best for keyword extraction).")
+        else:
+            topic = " ".join(kws[:2]).title()
+            st.markdown("**Title starting points** (only use one that honestly matches your video):")
+            st.code(
+                "\n".join(
+                    [
+                        f"The Surprising Truth About {topic}",
+                        f"How {topic} Works (Explained Simply)",
+                        f"5 Things You Should Know About {topic}",
+                        f"Is {topic} Worth Your Time?",
+                        f"Why Most People Get {topic} Wrong",
+                    ]
+                ),
+                language=None,
+            )
+            st.markdown("**Tags** (short and long-tail):")
+            st.code(
+                ", ".join(kws[:5] + [f"{kws[0]} {kws[1]}", f"what is {kws[0]}", f"{kws[0]} explained", f"{kws[0]} for beginners"]),
+                language=None,
+            )
+            st.markdown("**Hashtags:**")
+            st.code(" ".join("#" + k for k in kws[:3]), language=None)
+            secs_est = n_words / 2.5
+            st.markdown(f"**Length:** {n_words} words is about {fmt_ts(secs_est)} when narrated at a normal pace.")
+    st.markdown(
+        "**Hook formulas to adapt** (put one in your first line):\n"
+        "- Did you know that ...?\n- Most people think ..., but ...\n- In the next minute you'll learn ...\n"
+        "- Here's the one mistake that ...\n- What if ... wasn't true?\n- Three things about ... nobody explains\n"
+        "- By the end of this video you'll be able to ..."
     )
 
 mode = st.radio(
@@ -278,9 +506,10 @@ if mode.startswith("Text → Narrated"):
     fsize = c2.slider("Font size", 50, 160, 90)
     narrate = c3.checkbox("AI voice-over (gTTS)", True)
     lang = c4.selectbox("Voice language", ["en", "ar", "fr", "es", "de", "hi", "tr"])
-    k1, k2 = st.columns(2)
+    k1, k2, k3 = st.columns(3)
     col_a = k1.color_picker("Gradient top", "#14224a")
     col_b = k2.color_picker("Gradient bottom", "#782878")
+    zoom_on = k3.checkbox("Slow zoom (Ken Burns)", True)
     if st.button("Create YouTube package", type="primary"):
         lines = [l.strip() for l in script.splitlines() if l.strip()]
         if not lines:
@@ -296,17 +525,21 @@ if mode.startswith("Text → Narrated"):
                             from gtts import gTTS
 
                             ap = tmp_path(".mp3")
-                            gTTS(line, lang=lang).save(ap)
+                            make_voice(line, ap, lang)
                             audio = AudioFileClip(ap)
                             dur = max(secs, audio.duration + 0.6)
                         except Exception as e:
                             st.warning(f"Voice-over skipped for one line: {e}")
                     img = text_card(line, size, (hex_rgb(col_a), hex_rgb(col_b)), fsize)
-                    c = fadeout(fadein(ImageClip(np.array(img)).set_duration(dur), 0.4), 0.4)
+                    c = ImageClip(np.array(img)).set_duration(dur)
+                    if zoom_on:
+                        c = zoom_clip(c)
+                    c = fadeout(fadein(c, 0.4), 0.4)
                     if audio is not None:
                         c = c.set_audio(audio)
                     clips.append(c)
                 final = concatenate_videoclips(clips, method="compose")
+            chapters_text = build_chapters(lines, [c.duration for c in clips])
             finalize(final)
 
 # ------------------------------------------------------------------ Mode: stock footage (Pexels)
@@ -400,7 +633,12 @@ elif mode.startswith("Text → Stock"):
         else:
             size = PRESETS[preset]["size"]
             portrait = PRESETS[preset]["short"]
-            used, credits, clips = set(), [], []
+            used, credits, clips, narrs = set(), [], [], []
+            if not narrate:
+                st.warning(
+                    "No voice-over: videos made only of stock clips with no original commentary are the most "
+                    "likely to be rejected for monetisation."
+                )
             try:
                 prog = st.progress(0.0, text="Fetching clips...")
                 for i, raw in enumerate(lines):
@@ -412,7 +650,7 @@ elif mode.startswith("Text → Stock"):
                             from gtts import gTTS
 
                             ap = tmp_path(".mp3")
-                            gTTS(narration, lang=lang).save(ap)
+                            make_voice(narration, ap, lang)
                             audio = AudioFileClip(ap)
                             dur = max(secs, audio.duration + 0.6)
                         except Exception as e:
@@ -434,8 +672,10 @@ elif mode.startswith("Text → Stock"):
                     if audio is not None:
                         vc = vc.set_audio(audio)
                     clips.append(vc)
+                    narrs.append(narration)
                     prog.progress((i + 1) / len(lines), text=f"Scene {i + 1}/{len(lines)} ready")
                 final = concatenate_videoclips(clips, method="compose")
+                chapters_text = build_chapters(narrs, [c.duration for c in clips])
                 if credits:
                     site = "Pixabay" if is_pixabay else "Pexels"
                     description = description + f"\n\nVideo clips: {site} (" + ", ".join(sorted(set(credits))) + ")"
