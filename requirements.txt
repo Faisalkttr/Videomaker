@@ -5,3 +5,5 @@ numpy
 Pillow>=10.1
 huggingface_hub>=0.30
 gTTS
+edge-tts
+requests
