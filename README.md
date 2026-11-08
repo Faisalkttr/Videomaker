@@ -11,8 +11,9 @@ Every mode exports a **YouTube package** (ZIP): `video.mp4`, `thumbnail.jpg` (16
 
 ## Modes
 1. **Text → Narrated video**: script lines become scenes with AI voice-over (gTTS, many languages incl. Arabic), optional background music.
-2. **Text → AI video**: Hugging Face hosted model (needs a free token; short clips, can be repeated).
-3. **Video → Video**: trim, speed, B&W, mirror, caption, fades; any source is converted to 16:9 or 9:16 (blurred background or crop).
+2. **Text → Stock footage video (free)**: each script line is matched to a free stock clip, with voice-over and captions. Write scenes as `what the voice says | english search keywords`. Default source is **Pixabay**: sign up at pixabay.com, then copy your key from pixabay.com/api/docs, and add it in the app or as the secret `PIXABAY_API_KEY`. Pexels is still selectable, but Pexels has paused new API keys. Contributor names are added to the description automatically.
+3. **Text → AI video**: Hugging Face hosted model. Paid: Inference Providers need prepaid credits or PRO (a 402 error means no credit).
+4. **Video → Video**: trim, speed, B&W, mirror, caption, fades; any source is converted to 16:9 or 9:16 (blurred background or crop).
 
 ## Run locally
 ```bash
