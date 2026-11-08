@@ -1,3 +1,4 @@
+import gc
 import io
 import os
 import re
@@ -41,7 +42,9 @@ st.caption("Text → video and video → video. Output: MP4 + thumbnail + metada
 
 # ------------------------------------------------------------------ presets
 PRESETS = {
+    "YouTube video (16:9 · 1280x720, lighter)": {"size": (1280, 720), "short": False},
     "YouTube video (16:9 · 1920x1080)": {"size": (1920, 1080), "short": False},
+    "YouTube Short (9:16 · 720x1280, lighter)": {"size": (720, 1280), "short": True},
     "YouTube Short (9:16 · 1080x1920)": {"size": (1080, 1920), "short": True},
 }
 FONT_CANDIDATES = [
@@ -315,6 +318,53 @@ def seo_suggestions(text):
     return [w for w, _ in counts.most_common(8)], len(text.split())
 
 
+# ------------------------------------------------------------------ low-memory scene pipeline
+def download_file(url, path):
+    """Stream a download straight to disk (never hold the whole file in RAM)."""
+    with requests.get(url, stream=True, timeout=180) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+
+
+def render_scene(clip, path):
+    """Encode one scene to disk immediately so memory stays flat (fast, near-lossless)."""
+    clip.write_videofile(
+        path,
+        fps=30,
+        codec="libx264",
+        audio_codec="aac",
+        audio_fps=48000,
+        preset="ultrafast",
+        ffmpeg_params=["-crf", "18", "-pix_fmt", "yuv420p"],
+        logger=None,
+    )
+
+
+def concat_videos(paths, out):
+    """Join identically-encoded scene files without re-encoding."""
+    import imageio_ffmpeg
+
+    lst = tmp_path(".txt")
+    with open(lst, "w", encoding="utf-8") as f:
+        for p in paths:
+            f.write("file '" + p.replace("'", "'\\''") + "'\n")
+    subprocess.run(
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", out],
+        check=True,
+        capture_output=True,
+    )
+
+
+def safe_remove(path):
+    try:
+        if path:
+            os.remove(path)
+    except OSError:
+        pass
+
+
 # ------------------------------------------------------------------ fit / audio / export
 def blur_frame(f):
     img = Image.fromarray(f)
@@ -358,7 +408,7 @@ def export_youtube(clip, path):
         audio_codec="aac",
         audio_fps=48000,
         audio_bitrate="192k",
-        bitrate="8M",
+        bitrate="5M" if min(clip.size) <= 720 else "8M",
         preset="medium",
         ffmpeg_params=["-pix_fmt", "yuv420p", "-profile:v", "high", "-movflags", "+faststart"],
         logger=None,
@@ -404,8 +454,9 @@ def finalize(clip):
         export_youtube(clip, out)
         if loudnorm_on and clip.audio is not None:
             out = normalize_audio(out)
-        with open(out, "rb") as f:
-            video_bytes = f.read()
+        video_path = out
+        video_size = os.path.getsize(out)
+        big_video = video_size > 80 * 1024 * 1024  # keep RAM use low on small hosts
         thumbs = {} if cfg["short"] else make_thumb_variants(clip, thumb_text.strip() or title or "My Video")
         thumb = thumbs.get("A")
         desc = description
@@ -428,7 +479,8 @@ def finalize(clip):
             meta += "- ALTERED CONTENT: choose YES in YouTube Studio's upload details. It cannot be set from this file.\n"
         zbuf = io.BytesIO()
         with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("video.mp4", video_bytes)
+            if not big_video:
+                z.write(video_path, "video.mp4")
             z.writestr("metadata.txt", meta)
             for k, v in thumbs.items():
                 z.writestr(f"thumbnail_{k}.jpg", v)
@@ -438,9 +490,15 @@ def finalize(clip):
     if not cfg["short"] and dur < 480:
         st.caption("Tip: videos of 8+ minutes can carry mid-roll ads once you are monetised.")
     st.success(f"Ready: {cfg['size'][0]}x{cfg['size'][1]} · 30 fps · H.264/AAC · {dur:.0f}s")
-    st.video(video_bytes)
+    if big_video:
+        st.info(
+            f"The video is {video_size / 1e6:.0f} MB, so the in-page preview and the ZIP copy of the video are skipped "
+            "to save memory. Download video.mp4 with its own button."
+        )
+    else:
+        st.video(video_path)
     c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("⬇️ video.mp4", video_bytes, "video.mp4", "video/mp4")
+    c1.download_button("⬇️ video.mp4", open(video_path, "rb"), "video.mp4", "video/mp4")
     if thumb:
         c2.download_button("⬇️ thumbnail.jpg", thumb, "thumbnail.jpg", "image/jpeg")
     c3.download_button("⬇️ metadata.txt", meta, "metadata.txt")
@@ -611,7 +669,7 @@ elif mode.startswith("Text → Stock"):
     lang = c3.selectbox("Voice language", ["en", "ar", "fr", "es", "de", "hi", "tr"])
     show_caps = c4.checkbox("Show captions", True)
 
-    def stock_pick(use_pixabay, key, query, portrait, used):
+    def stock_pick(use_pixabay, key, query, portrait, used, target=1080):
         """Search the chosen stock site and download one unused clip. Returns (path, id, author) or None."""
         cands = []  # (id, author, [ {url, width, height} ])
         if use_pixabay:
@@ -653,11 +711,9 @@ elif mode.startswith("Text → Stock"):
                 if need_orientation and not any((f["height"] > f["width"]) == portrait for f in files):
                     continue
                 pool = [f for f in files if (f["height"] > f["width"]) == portrait] if need_orientation else files
-                best = min(pool, key=lambda f: abs(min(f["width"], f["height"]) - 1080))
-                data = requests.get(best["url"], timeout=180).content
+                best = min(pool, key=lambda f: abs(min(f["width"], f["height"]) - target))
                 path = tmp_path()
-                with open(path, "wb") as f:
-                    f.write(data)
+                download_file(best["url"], path)
                 return path, vid, author
         return None
 
@@ -670,7 +726,7 @@ elif mode.startswith("Text → Stock"):
         else:
             size = PRESETS[preset]["size"]
             portrait = PRESETS[preset]["short"]
-            used, credits, clips, narrs = set(), [], [], []
+            used, credits, narrs, scene_files, scene_durs = set(), [], [], [], []
             if not narrate:
                 st.warning(
                     "No voice-over: videos made only of stock clips with no original commentary are the most "
@@ -692,7 +748,8 @@ elif mode.startswith("Text → Stock"):
                             dur = max(secs, audio.duration + 0.6)
                         except Exception as e:
                             st.warning(f"Voice-over skipped for scene {i + 1}: {e}")
-                    pick = stock_pick(is_pixabay, pkey, query, portrait, used)
+                    pick = stock_pick(is_pixabay, pkey, query, portrait, used, min(size))
+                    src_path = pick[0] if pick else None
                     if pick:
                         used.add(pick[1])
                         credits.append(pick[2])
@@ -708,11 +765,28 @@ elif mode.startswith("Text → Stock"):
                     vc = fadeout(fadein(vc, 0.3), 0.3)
                     if audio is not None:
                         vc = vc.set_audio(audio)
-                    clips.append(vc)
+                    # write this scene to disk now, then free everything it used
+                    sf = tmp_path()
+                    render_scene(vc, sf)
+                    scene_files.append(sf)
+                    scene_durs.append(vc.duration)
                     narrs.append(narration)
+                    for obj in (vc, audio):
+                        try:
+                            if obj is not None:
+                                obj.close()
+                        except Exception:
+                            pass
+                    safe_remove(src_path)
+                    gc.collect()
                     prog.progress((i + 1) / len(lines), text=f"Scene {i + 1}/{len(lines)} ready")
-                final = concatenate_videoclips(clips, method="compose")
-                chapters_text = build_chapters(narrs, [c.duration for c in clips], heads)
+                prog.progress(1.0, text="Joining scenes...")
+                joined = tmp_path()
+                concat_videos(scene_files, joined)
+                for sf in scene_files:
+                    safe_remove(sf)
+                final = VideoFileClip(joined)
+                chapters_text = build_chapters(narrs, scene_durs, heads)
                 if credits:
                     site = "Pixabay" if is_pixabay else "Pexels"
                     description = description + f"\n\nVideo clips: {site} (" + ", ".join(sorted(set(credits))) + ")"
@@ -784,4 +858,3 @@ else:
             if mute:
                 c = c.without_audio()
             finalize(c)
-
