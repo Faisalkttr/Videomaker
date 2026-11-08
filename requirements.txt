@@ -1,0 +1,7 @@
+streamlit>=1.40
+moviepy==1.0.3
+imageio-ffmpeg
+numpy
+Pillow>=10.1
+huggingface_hub>=0.30
+gTTS
