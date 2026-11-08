@@ -17,6 +17,15 @@ from moviepy.editor import (
     concatenate_videoclips,
 )
 from moviepy.video.fx.all import blackwhite, crop, fadein, fadeout, mirror_x, speedx
+from moviepy.video.fx.all import loop as vloop
+import requests
+
+
+def get_secret(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
 
 st.set_page_config(page_title="YouTube Video Generator", page_icon="🎬", layout="wide")
 st.title("🎬 YouTube-Ready Video Generator")
@@ -252,7 +261,7 @@ with st.expander("⚠️ Read before monetising on YouTube"):
 
 mode = st.radio(
     "Mode",
-    ["Text → Narrated video", "Text → AI video (Hugging Face)", "Video → Video"],
+    ["Text → Narrated video", "Text → Stock footage video (free)", "Text → AI video (Hugging Face)", "Video → Video"],
     horizontal=True,
 )
 
@@ -300,11 +309,147 @@ if mode.startswith("Text → Narrated"):
                 final = concatenate_videoclips(clips, method="compose")
             finalize(final)
 
+# ------------------------------------------------------------------ Mode: stock footage (Pexels)
+elif mode.startswith("Text → Stock"):
+    st.subheader("Text → Stock footage video (free clips)")
+    st.info(
+        "Free key: sign up at pixabay.com, then open pixabay.com/api/docs to see your key. "
+        "Write each scene as: `what the voice says | english search keywords`. "
+        "The part after | is optional; without it the sentence itself is used as the search."
+    )
+    source = st.radio(
+        "Footage source",
+        ["Pixabay (free key)", "Pexels (only if you already have a key; new keys are paused)"],
+        horizontal=True,
+    )
+    is_pixabay = source.startswith("Pixabay")
+    pkey = st.text_input(
+        f"{'Pixabay' if is_pixabay else 'Pexels'} API key",
+        value=get_secret("PIXABAY_API_KEY" if is_pixabay else "PEXELS_API_KEY"),
+        type="password",
+    )
+    script = st.text_area(
+        "Script (one scene per line)",
+        "Space is bigger than you think | galaxy stars night sky\n"
+        "Light from the Sun takes eight minutes to reach us | sun sunrise\n"
+        "Subscribe for more space facts | telescope observatory",
+        height=200,
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    secs = c1.slider("Min seconds/scene", 3.0, 12.0, 5.0, 0.5)
+    narrate = c2.checkbox("AI voice-over (gTTS)", True)
+    lang = c3.selectbox("Voice language", ["en", "ar", "fr", "es", "de", "hi", "tr"])
+    show_caps = c4.checkbox("Show captions", True)
+
+    def stock_pick(use_pixabay, key, query, portrait, used):
+        """Search the chosen stock site and download one unused clip. Returns (path, id, author) or None."""
+        cands = []  # (id, author, [ {url, width, height} ])
+        if use_pixabay:
+            r = requests.get(
+                "https://pixabay.com/api/videos/",
+                params={"key": key, "q": query[:100], "per_page": 20, "safesearch": "true"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            for v in r.json().get("hits", []):
+                files = [
+                    {"url": f["url"], "width": f["width"], "height": f.get("height") or 0}
+                    for f in (v.get("videos") or {}).values()
+                    if f.get("url") and f.get("width")
+                ]
+                if files:
+                    cands.append((v["id"], v.get("user", "Pixabay contributor"), files))
+        else:
+            r = requests.get(
+                "https://api.pexels.com/videos/search",
+                headers={"Authorization": key},
+                params={"query": query, "per_page": 10, "orientation": "portrait" if portrait else "landscape"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            for v in r.json().get("videos", []):
+                files = [
+                    {"url": f["link"], "width": f["width"], "height": f["height"]}
+                    for f in v.get("video_files", [])
+                    if f.get("file_type") == "video/mp4" and f.get("width")
+                ]
+                if files:
+                    cands.append((v["id"], v.get("user", {}).get("name", "Pexels contributor"), files))
+        # first pass: matching orientation; second pass: anything unused (fit_clip handles the rest)
+        for need_orientation in (True, False):
+            for vid, author, files in cands:
+                if vid in used:
+                    continue
+                if need_orientation and not any((f["height"] > f["width"]) == portrait for f in files):
+                    continue
+                pool = [f for f in files if (f["height"] > f["width"]) == portrait] if need_orientation else files
+                best = min(pool, key=lambda f: abs(min(f["width"], f["height"]) - 1080))
+                data = requests.get(best["url"], timeout=180).content
+                path = tmp_path()
+                with open(path, "wb") as f:
+                    f.write(data)
+                return path, vid, author
+        return None
+
+    if st.button("Create YouTube package", type="primary"):
+        lines = [l.strip() for l in script.splitlines() if l.strip()]
+        if not pkey:
+            st.error("Please add your stock-footage API key.")
+        elif not lines:
+            st.error("Write at least one line.")
+        else:
+            size = PRESETS[preset]["size"]
+            portrait = PRESETS[preset]["short"]
+            used, credits, clips = set(), [], []
+            try:
+                prog = st.progress(0.0, text="Fetching clips...")
+                for i, raw in enumerate(lines):
+                    narration, _, kw = raw.partition("|")
+                    narration, query = narration.strip(), (kw.strip() or narration.strip())
+                    dur, audio = secs, None
+                    if narrate:
+                        try:
+                            from gtts import gTTS
+
+                            ap = tmp_path(".mp3")
+                            gTTS(narration, lang=lang).save(ap)
+                            audio = AudioFileClip(ap)
+                            dur = max(secs, audio.duration + 0.6)
+                        except Exception as e:
+                            st.warning(f"Voice-over skipped for scene {i + 1}: {e}")
+                    pick = stock_pick(is_pixabay, pkey, query, portrait, used)
+                    if pick:
+                        used.add(pick[1])
+                        credits.append(pick[2])
+                        vc = VideoFileClip(pick[0]).without_audio()
+                        vc = vloop(vc, duration=dur) if vc.duration < dur else vc.subclip(0, dur)
+                        vc = fit_clip(vc, size, fit_mode)
+                    else:
+                        st.warning(f"No stock clip found for: {query}. Using a colour card.")
+                        img = text_card(narration, size, ((20, 30, 70), (120, 40, 120)), 80)
+                        vc = ImageClip(np.array(img)).set_duration(dur)
+                    if show_caps:
+                        vc = overlay_caption(vc, narration)
+                    vc = fadeout(fadein(vc, 0.3), 0.3)
+                    if audio is not None:
+                        vc = vc.set_audio(audio)
+                    clips.append(vc)
+                    prog.progress((i + 1) / len(lines), text=f"Scene {i + 1}/{len(lines)} ready")
+                final = concatenate_videoclips(clips, method="compose")
+                if credits:
+                    site = "Pixabay" if is_pixabay else "Pexels"
+                    description = description + f"\n\nVideo clips: {site} (" + ", ".join(sorted(set(credits))) + ")"
+                finalize(final)
+            except requests.HTTPError as e:
+                st.error(f"Stock-footage request failed ({e}). Check your API key.")
+            except Exception as e:
+                st.error(f"Failed: {e}")
+
 # ------------------------------------------------------------------ Mode 2: AI text-to-video
 elif mode.startswith("Text → AI"):
     st.subheader("Text → AI video (Hugging Face)")
     st.info("Needs a free token from huggingface.co/settings/tokens. Free quota is limited; clips are short (a few seconds).")
-    token = st.secrets.get("HF_TOKEN", "") if hasattr(st, "secrets") else ""
+    token = get_secret("HF_TOKEN")
     token = st.text_input("Hugging Face token", value=token, type="password")
     c1, c2 = st.columns(2)
     model = c1.text_input("Model", "Wan-AI/Wan2.1-T2V-14B")
