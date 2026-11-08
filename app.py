@@ -252,8 +252,39 @@ def fmt_ts(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def build_chapters(texts, durations, min_len=10):
+def parse_script(script):
+    """Split a script into scene lines and chapter headings (lines starting with '#')."""
+    lines, heads = [], []
+    for raw in script.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            heads.append((len(lines), s.lstrip("#").strip()[:60]))
+        else:
+            lines.append(s)
+    return lines, heads
+
+
+def build_chapters(texts, durations, heads=None, min_len=10):
     """YouTube chapters: start at 0:00, at least 3, each at least 10 s. Returns '' if not possible."""
+    if heads:
+        starts, t = [], 0.0
+        for d in durations:
+            starts.append(t)
+            t += d
+        chapters = [(starts[i], label) for i, label in heads if i < len(starts)]
+        if chapters and chapters[0][0] > 0:
+            chapters.insert(0, (0.0, "Intro"))
+        kept = []
+        for s, label in chapters:
+            if not kept or s - kept[-1][0] >= min_len:
+                kept.append((s, label))
+        if len(kept) >= 2 and t - kept[-1][0] < min_len:
+            kept.pop()
+        if len(kept) < 3:
+            return ""
+        return "\n".join(f"{fmt_ts(s)} {label}" for s, label in kept)
     chapters, t, last = [], 0.0, None
     for text, d in zip(texts, durations):
         if last is None or t - last >= min_len:
@@ -371,7 +402,7 @@ def finalize(clip):
             out = normalize_audio(out)
         with open(out, "rb") as f:
             video_bytes = f.read()
-        thumbs = {} if cfg["short"] else make_thumb_variants(clip, title or "My Video")
+        thumbs = {} if cfg["short"] else make_thumb_variants(clip, thumb_text.strip() or title or "My Video")
         thumb = thumbs.get("A")
         desc = description
         if music_file is not None and music_credit.strip():
@@ -425,6 +456,7 @@ fit_mode = st.sidebar.radio("If source doesn't match", ["Blurred background", "C
 title = st.sidebar.text_input("Title (max 100)", "My Awesome Video", max_chars=100)
 description = st.sidebar.text_area("Description", "Made with Streamlit.")
 tags = st.sidebar.text_input("Tags (comma separated)", "video, tutorial")
+thumb_text = st.sidebar.text_input("Thumbnail text (short; blank = use title)", max_chars=60)
 st.sidebar.subheader("Background music (optional)")
 music_file = st.sidebar.file_uploader("Music you have rights to", type=["mp3", "wav", "m4a"])
 music_vol = st.sidebar.slider("Music volume", 0.0, 1.0, 0.15, 0.05)
@@ -511,7 +543,7 @@ if mode.startswith("Text → Narrated"):
     col_b = k2.color_picker("Gradient bottom", "#782878")
     zoom_on = k3.checkbox("Slow zoom (Ken Burns)", True)
     if st.button("Create YouTube package", type="primary"):
-        lines = [l.strip() for l in script.splitlines() if l.strip()]
+        lines, heads = parse_script(script)
         if not lines:
             st.error("Write at least one line.")
         else:
@@ -539,7 +571,7 @@ if mode.startswith("Text → Narrated"):
                         c = c.set_audio(audio)
                     clips.append(c)
                 final = concatenate_videoclips(clips, method="compose")
-            chapters_text = build_chapters(lines, [c.duration for c in clips])
+            chapters_text = build_chapters(lines, [c.duration for c in clips], heads)
             finalize(final)
 
 # ------------------------------------------------------------------ Mode: stock footage (Pexels)
@@ -548,7 +580,8 @@ elif mode.startswith("Text → Stock"):
     st.info(
         "Free key: sign up at pixabay.com, then open pixabay.com/api/docs to see your key. "
         "Write each scene as: `what the voice says | english search keywords`. "
-        "The part after | is optional; without it the sentence itself is used as the search."
+        "The part after | is optional; without it the sentence itself is used as the search. "
+        "Lines starting with # are chapter titles (not scenes) and go into the YouTube description."
     )
     source = st.radio(
         "Footage source",
@@ -625,7 +658,7 @@ elif mode.startswith("Text → Stock"):
         return None
 
     if st.button("Create YouTube package", type="primary"):
-        lines = [l.strip() for l in script.splitlines() if l.strip()]
+        lines, heads = parse_script(script)
         if not pkey:
             st.error("Please add your stock-footage API key.")
         elif not lines:
@@ -675,7 +708,7 @@ elif mode.startswith("Text → Stock"):
                     narrs.append(narration)
                     prog.progress((i + 1) / len(lines), text=f"Scene {i + 1}/{len(lines)} ready")
                 final = concatenate_videoclips(clips, method="compose")
-                chapters_text = build_chapters(narrs, [c.duration for c in clips])
+                chapters_text = build_chapters(narrs, [c.duration for c in clips], heads)
                 if credits:
                     site = "Pixabay" if is_pixabay else "Pexels"
                     description = description + f"\n\nVideo clips: {site} (" + ", ".join(sorted(set(credits))) + ")"
