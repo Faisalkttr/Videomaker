@@ -11,6 +11,10 @@ import zipfile
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+
+# moviepy 1.0.3 still uses Image.ANTIALIAS, which Pillow 10+ removed
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.LANCZOS
 from moviepy.editor import (
     AudioFileClip,
     CompositeAudioClip,
@@ -780,3 +784,4 @@ else:
             if mute:
                 c = c.without_audio()
             finalize(c)
+
